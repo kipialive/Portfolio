@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-warabej793-stg-v3
+  namespace: front-end-v3
+  labels:
+    environment: stg
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend-warabej793-stg-v3
+  template:
+    metadata:
+      labels:
+        app: frontend-warabej793-stg-v3
+    spec:
+      containers:
+        - name: frontend-warabej793-stg-v3
+          image: ${IMAGE_URI}
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "500m"
+          env:
+            - name: NODE_ENV
+              value: "${NODE_ENV_NAME}"
+            - name: NEXT_PUBLIC_API_URL
+              value: "${BACKEND_URL}"
+            - name: AUTH_SECRET
+              value: "${AUTH_SECRET}"
+            - name: AUTH_URL
+              value: "${AUTH_URL}"

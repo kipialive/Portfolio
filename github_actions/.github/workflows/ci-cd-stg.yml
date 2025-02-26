@@ -1,0 +1,141 @@
+name: CI/CD Pipeline for Node.js Front-End Application
+
+on:
+  push:
+    branches:
+      - vladimir-test
+      - stg
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  build-and-deploy-frontend-web-application-to-eks:
+    name: Build, Push, and Deploy Web Application to EKS
+    runs-on: ubuntu-24.04
+
+    env: # Declare global environment variables here
+      REPO_NAME: frontend-warabej793-stg
+      EKS_NAME: warabej793-stg-eks-01
+      BACKEND_URL: http://backend-warabej793-stg-int-alb.warabej793.com:3000
+      NODE_ENV_NAME: development
+      AUTH_URL: http://stg.frontend.warabej793.com/
+      AUTH_SECRET: dev-secret
+      AUTH_TRUST_HOST: 1
+      KUBECONFIG: /home/runner/.kube/config
+      NAMESPACE: front-end-v3
+
+    steps:
+      # Step 1: Checkout the repository (This ensures the GitHub Actions runner has access to your repo)
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Step 2: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/warabej793-GitHubActionsRole
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Step 3: Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2 
+
+      # # Step 4: Cache Docker layers to speed up subsequent builds
+      # - name: Cache Docker layers
+      #   uses: actions/cache@v3
+      #   with:
+      #     path: /tmp/.docker-cache
+      #     key: ${{ runner.os }}-docker-${{ github.sha }}
+      #     restore-keys: |
+      #       ${{ runner.os }}-docker-  
+
+      # Step 4.1: Build and tag Docker image
+      - name: Build Docker image
+        run: |
+          set -e
+          
+          # Define variables
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}:${IMAGE_TAG}
+
+           # Use subshell to scope the environment variables only to the docker build command
+          export GH_TOKEN='${{ secrets.GH_TOKEN }}'
+          export GITHUB_ORG='${{ github.repository_owner }}'
+          docker build \
+            --build-arg NEXT_PUBLIC_API_URL=$BACKEND_URL \
+            --secret id=gh_token,env=GH_TOKEN \
+            --secret id=gh_org,env=GITHUB_ORG \
+            --progress=plain \
+            -t $IMAGE_URI .
+
+          # Export IMAGE_URI for subsequent steps
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+      
+      # Step 5: Push Docker image to Amazon ECR
+      - name: Push Docker image to Amazon ECR
+        if: github.event_name == 'push' && contains(github.ref, 'refs/heads/') # Push only for branch events
+        run: |
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}:${{ github.sha }}
+
+      # Step 6: Generate kubeconfig for EKS
+      - name: Generate kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_NAME }} --region ${{ secrets.AWS_REGION }}
+      
+      - name: Substitute environment variables in deployment.yaml
+        run: |
+          export IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}:${{ github.sha }}
+          export BACKEND_URL=$BACKEND_URL
+          export NODE_ENV_NAME=$NODE_ENV_NAME
+          export AUTH_URL=$AUTH_URL
+          export AUTH_SECRET=$AUTH_SECRET
+          if [ -z "$IMAGE_URI" ] || [ -z "$BACKEND_URL" ] || [ -z "$NODE_ENV_NAME" ] || [ -z "$AUTH_URL" ] || [ -z "$AUTH_SECRET" ]; then
+            echo "Required environment variables are not set. Exiting..."
+            exit 1
+          fi
+          envsubst '${IMAGE_URI},${BACKEND_URL},${NODE_ENV_NAME},${AUTH_URL},${AUTH_SECRET}' < ./k8s/deployment.yaml > ./k8s/deployment-updated.yaml
+   
+      # Validate the Kubernetes manifests before deployment
+      - name: Validate Kubernetes Manifests
+        run: |
+          kubectl apply --dry-run=client -f ./k8s/deployment-updated.yaml
+
+      # # Install kube-linter
+      # - name: Install KubeLinter
+      #   run: |
+      #     curl -sSL https://github.com/stackrox/kube-linter/releases/download/v0.7.1/kube-linter-linux.tar.gz | tar -xz
+      #     sudo mv kube-linter /usr/local/bin/ 
+      
+      # # Validate Kubernetes Manifests
+      # - name: Lint Kubernetes Manifests
+      #   run: |
+      #     kube-linter lint ./k8s/deployment-updated.yaml
+      #     kube-linter lint ./k8s/service.yaml
+
+      # Step Pre-Deploy to K8s
+      - name: Create namespace if it does not exist
+        run: |
+          kubectl get namespace ${{ env.NAMESPACE }} || kubectl create namespace ${{ env.NAMESPACE }}
+      
+      # Step 7: Deploy to Kubernetes
+      - name: Deploy to Kubernetes
+        uses: azure/k8s-deploy@v5
+        with:
+          manifests: |
+            ./k8s/deployment-updated.yaml
+            ./k8s/service.yaml
+          images: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.REPO_NAME }}:${{ github.sha }}
+          namespace: ${{ env.NAMESPACE }}
+      
+      # Step 7.1: Monitoring Deployment status after applying the manifests
+      - name: Monitor Deployment
+        run: kubectl rollout status deployment/frontend-warabej793-stg-v3 -n ${{ env.NAMESPACE }}
+      
+      # Step 8: Cleanup temporary files
+      - name: Cleanup temporary files
+        run: rm ./k8s/deployment-updated.yaml
